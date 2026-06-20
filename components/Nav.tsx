@@ -27,6 +27,9 @@ export function Nav() {
               <NavLink href="/decrypt" current={pathname}>
                 Descifrar
               </NavLink>
+              <NavLink href="/inbox" current={pathname}>
+                Bandeja segura
+              </NavLink>
               {session.isAdmin && (
                 <NavLink href="/admin" current={pathname}>
                   Admin
