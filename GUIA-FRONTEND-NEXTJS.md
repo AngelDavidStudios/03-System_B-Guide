@@ -4,7 +4,7 @@
 **Stack fijo:** Next.js 16 (App Router) + React 19 + TypeScript + Tailwind CSS 4 + axios. Puerto **5174**.
 **Premisa:** Sistema B **NUNCA** ve tokens JWT. La autenticación se maneja vía cookie HttpOnly que emite Sistema C. Tú solo haces peticiones HTTP y dejas que el browser maneje la cookie.
 
-> **El backend (Sistema C) YA ESTÁ DESPLEGADO** en la nube (HTTPS). No necesitas levantarlo ni tener AWS: solo apuntas tu `.env.local` a la URL del backend y trabajas el frontend.
+> **El backend (Sistema C) YA ESTÁ DESPLEGADO** en AWS Lambda (Function URL, HTTPS). No necesitas levantarlo ni tener AWS: solo apuntas tu `.env.local` a esa URL y trabajas el frontend.
 >
 > ⚠️ **Prueba en Chrome.** El backend y este frontend son sitios distintos (cross-site), así que la cookie de sesión es "third-party": Chrome la permite, **Safari la bloquea**. Detalle en § 3.2 y § 8.
 
@@ -56,7 +56,7 @@ Aunque Sistema B es esencialmente un SPA y **no** explotamos Server Components n
 │   │   └── roles.ts           # listRoles
 │   └── session/
 │       └── SessionContext.tsx # React Context = equivalente del store Pinia de A
-├── .env.local                 # NEXT_PUBLIC_API_URL=<URL del backend>  (no se commitea)
+├── .env.local                 # NEXT_PUBLIC_API_URL=<URL del Lambda>  (no se commitea)
 ├── next.config.ts             # rewrites /api/* → :3000 (solo dev local opcional)
 ├── package.json               # scripts en puerto 5174
 ├── tsconfig.json              # paths "@/*": ["./*"]
@@ -85,11 +85,11 @@ Aunque Sistema B es esencialmente un SPA y **no** explotamos Server Components n
 
 ### 3.2 Conexión al backend: axios directo vía `NEXT_PUBLIC_API_URL`
 
-El backend está desplegado (en la nube, HTTPS). B lo llama **directo** con axios, no por proxy. La base se controla con una env var:
+El backend está desplegado (Lambda HTTPS). B lo llama **directo** con axios, no por proxy. La base se controla con una env var:
 
 ```bash
 # .env.local  (en 03-System_B/, NO se commitea)
-NEXT_PUBLIC_API_URL=<URL_DEL_BACKEND>
+NEXT_PUBLIC_API_URL=https://xxxxxxxx.lambda-url.us-east-1.on.aws
 ```
 
 ```ts
@@ -97,14 +97,14 @@ NEXT_PUBLIC_API_URL=<URL_DEL_BACKEND>
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 ```
 
-- **Con `NEXT_PUBLIC_API_URL` definida** (el caso normal ahora): axios pega directo al backend. La URL te la entrega David en persona.
+- **Con `NEXT_PUBLIC_API_URL` definida** (el caso normal ahora): axios pega directo al Lambda. La URL te la da quien mantiene Sistema C.
 - **Sin definirla**: cae al rewrite local `/api → :3000` (solo si levantas un backend en tu máquina; normalmente no hace falta).
 
-> Pídele a David la **URL del backend** (la entrega en persona) y ponla en tu `.env.local`. Reinicia `pnpm dev` después (Next lee el env al arrancar).
+> Pídele al backend la **URL del Lambda** y ponla en tu `.env.local`. Reinicia `pnpm dev` después (Next lee el env al arrancar).
 
-**¿Por qué directo y no proxy contra el backend?** El login es una navegación top-level: Cognito redirige al `/auth/callback` **del backend**, así que la cookie de sesión queda en el dominio del backend. Un proxy (petición server-side) no llevaría esa cookie. Llamando directo, el browser sí la adjunta (cross-site) en cada XHR.
+**¿Por qué directo y no proxy contra el Lambda?** El login es una navegación top-level: Cognito redirige al `/auth/callback` **del Lambda**, así que la cookie de sesión queda en el dominio del Lambda. Un proxy (petición server-side) no llevaría esa cookie. Llamando directo, el browser sí la adjunta (cross-site) en cada XHR.
 
-**Cookie cross-site (lee esto):** B (`localhost`/Vercel) y el backend (otro dominio) son **sitios distintos** → la cookie es third-party, marcada `SameSite=None; Secure` por el backend. Implicaciones:
+**Cookie cross-site (lee esto):** B (`localhost`/Vercel) y el backend (`lambda...on.aws`) son **sitios distintos** → la cookie es third-party, marcada `SameSite=None; Secure` por el backend. Implicaciones:
 
 - ✅ **Chrome**: funciona (permite third-party cookies). Es el navegador para probar/demostrar.
 - ❌ **Safari**: las bloquea por defecto (ITP) → la sesión no persiste. No es bug tuyo.
@@ -118,7 +118,7 @@ El backend mantiene una **allowlist de orígenes** (`ALLOWED_ORIGINS`). Tu `loca
 // lib/api/client.ts
 import axios, { AxiosError } from "axios";
 
-// backend si NEXT_PUBLIC_API_URL está definida; si no, proxy local /api → :3000.
+// Lambda si NEXT_PUBLIC_API_URL está definida; si no, proxy local /api → :3000.
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 
 export const api = axios.create({
@@ -412,6 +412,9 @@ Todos vía `api` (base = `NEXT_PUBLIC_API_URL`). Las XHR llevan la cookie (`with
 | POST | `/auth/verify-token` | — | Bearer | server-to-server / Postman |
 | POST | `/kms/encrypt` | `{ payload: string }` | sesión | devuelve `{ encryptedPayload, encryptedDataKey }` |
 | POST | `/kms/decrypt` | `{ encryptedPayload, encryptedDataKey }` | sesión | devuelve `{ payload }` |
+| POST | `/messages` | `{ action: "list" }` | sesión | bandeja segura: metadatos sin descifrar (§11) |
+| POST | `/messages` | `{ action: "decrypt", messageId }` | sesión | descifra un reporte (KMS) y lo marca leído |
+| POST | `/messages` | `{ action: "delete", messageId }` | sesión + Admin/Manager | elimina un reporte |
 | GET | `/roles` | — | sesión + Admin | lista grupos |
 | GET | `/roles/user/:username` | — | sesión + Admin | grupos de un user |
 | POST | `/roles/:groupName/users/:username` | — | sesión + Admin | 204 |
@@ -541,18 +544,98 @@ El backend ya está en la nube, así que desplegar B es directo:
 
 1. **Vercel → Project Settings → Environment Variables:**
    ```
-   NEXT_PUBLIC_API_URL = <URL_DEL_BACKEND>
+   NEXT_PUBLIC_API_URL = https://xxxxxxxx.lambda-url.us-east-1.on.aws
    ```
-   (la misma URL del backend que usas en local). El `callback` de Cognito **no cambia** — sigue siendo el del backend.
+   (la misma URL del Lambda que usas en local). El `callback` de Cognito **no cambia** — sigue siendo el del Lambda.
 
 2. **Coordina con quien mantiene Sistema C** (un solo paso, sin tocar código del backend):
-   - Agregar tu dominio de Vercel (ej. `https://mi-b.vercel.app`) a la env `ALLOWED_ORIGINS` del backend → habilita el CORS.
+   - Agregar tu dominio de Vercel (ej. `https://mi-b.vercel.app`) a la env `ALLOWED_ORIGINS` del Lambda → habilita el CORS.
    - Registrar ese mismo dominio en Cognito App Client → **Allowed sign-out URLs**.
 
 3. **Deploy.** Vercel detecta Next.js solo (`next build`). No hay API Routes ni `output: export` que configurar.
 
-> Recuerda el caveat cross-site: el sitio en Vercel + el backend siguen siendo sitios distintos → demo en **Chrome**.
+> Recuerda el caveat cross-site: el sitio en Vercel + backend Lambda siguen siendo sitios distintos → demo en **Chrome**.
 
 ---
 
-*Última revisión: 2026-06-15 — David Rueda — ISWZ3206 UDLA. Backend (Sistema C) desplegado en la nube; B lo consume directo vía `NEXT_PUBLIC_API_URL`.*
+## 11. Bandeja segura (reportes cifrados KMS A → B)
+
+La demo de cifrado A→B real (no el copy/paste de `/decrypt`) es una **bandeja estilo Outlook**: RR.HH. (Sistema A) envía un **Reporte Confidencial** que el BFF cifra con AWS KMS y guarda en DynamoDB; Dirección (Sistema B) lo lista y, **al seleccionarlo, se descifra automáticamente** (sin botón intermedio).
+
+**Qué viaja:** la lista (`action: "list"`) trae solo metadatos legibles (asunto, remitente, fecha, nivel). Los campos sensibles (`employee`, `description`, `eventDate`) viven únicamente dentro de `encryptedPayload` y solo aparecen tras `action: "decrypt"`. Ni B ni A ven jamás `encryptedPayload`/`encryptedDataKey`: todo el cifrado vive en el BFF.
+
+### 11.1 Cliente API (`lib/api/messages.ts`)
+
+```ts
+import { api } from "./client";
+
+export type MessageType = "incident" | "evaluation" | "alert" | "special-request";
+export type ConfidentialityLevel = "normal" | "confidential" | "very-confidential";
+export type MessageStatus = "unread" | "read";
+
+export interface SecureMessageSummary {
+  messageId: string;
+  subject: string;
+  type: MessageType;
+  confidentialityLevel: ConfidentialityLevel;
+  sentBy: string;
+  sentByName: string;
+  sentAt: string;
+  status: MessageStatus;
+}
+export interface SecureMessageContent extends SecureMessageSummary {
+  employee: string;
+  eventDate: string;
+  description: string;
+}
+
+export async function listMessages(): Promise<SecureMessageSummary[]> {
+  const { data } = await api.post<{ messages: SecureMessageSummary[] }>(
+    "/messages", { action: "list" });
+  return data.messages;
+}
+export async function decryptMessage(messageId: string): Promise<SecureMessageContent> {
+  const { data } = await api.post<SecureMessageContent>(
+    "/messages", { action: "decrypt", messageId });
+  return data;
+}
+export async function deleteMessage(messageId: string): Promise<void> {
+  await api.post("/messages", { action: "delete", messageId }); // 403 si no es Admin/Manager
+}
+```
+
+### 11.2 Página (`app/inbox/page.tsx`)
+
+Layout de dos paneles (`grid md:grid-cols-[320px_1fr]`): lista a la izquierda, contenido a la derecha. La clave del patrón Outlook es **descifrar en el `onSelect`**, no en un botón:
+
+```tsx
+async function onSelect(id: string) {
+  setSelectedId(id);
+  setContent(null);
+  setDecrypting(true);
+  try {
+    const full = await decryptMessage(id);     // ← KMS decrypt automático
+    setContent(full);
+    setMessages((prev) =>                        // refleja "read" sin re-fetch
+      prev.map((m) => (m.messageId === id ? { ...m, status: "read" } : m)));
+  } finally {
+    setDecrypting(false);
+  }
+}
+```
+
+Envuelve todo en `<Protected>` (cualquier autenticado puede leer). El botón **Eliminar** se muestra solo si `session.isAdmin` (el backend igual rechaza con 403 a quien no sea Admin/Manager). El badge de nivel usa colores: `normal`→slate, `confidential`→ámbar, `very-confidential`→rojo. Implementación completa de referencia en `03-System_B/app/inbox/page.tsx`.
+
+### 11.3 Nav
+
+Añade el enlace dentro del bloque autenticado de `components/Nav.tsx`:
+
+```tsx
+<NavLink href="/inbox" current={pathname}>Bandeja segura</NavLink>
+```
+
+El lado emisor (formulario) vive en Sistema A (Vue) — ver `Module_WFN-One/src/views/SecureReportView.vue`. Para la demo completa: A envía → DynamoDB guarda el payload opaco → B abre y descifra en el momento.
+
+---
+
+*Última revisión: 2026-06-20 — David Rueda — ISWZ3206 UDLA. Backend (Sistema C) desplegado en AWS Lambda; B lo consume directo vía `NEXT_PUBLIC_API_URL`. Añadida §11 (bandeja segura KMS A→B).*
